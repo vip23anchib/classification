@@ -2,10 +2,6 @@ fastapi
 uvicorn[standard]
 python-multipart
 pillow
-numpy
-onnxruntime
-
-tensorflow
-
-# only needed for the one-time conversion (convert_to_onnx.py)
-# tf2onnx
+pydantic
+python-dotenv
+httpx

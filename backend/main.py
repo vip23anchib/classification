@@ -1,131 +1,129 @@
-"""
-FastAPI backend for UNet satellite image segmentation.
-Run with:  uvicorn main:app --host 127.0.0.1 --port 8001
-"""
-
-import io
+import logging
 import os
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-import numpy as np
-from PIL import Image
-import tensorflow as tf
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 
-from constants import INPUT_SIZE, NUM_CLASSES
-from model import build_unet
+from schemas.response_schema import AnalyzeResponse, HealthResponse
+from services.gemini_service import (
+    GeminiServiceError,
+    analyze_image,
+    close_gemini_client,
+    generate_image,
+    get_improvements,
+)
+from utils.image_utils import MAX_FILE_SIZE_BYTES, validate_upload
 
-# ── Load Keras model ──────────────────────────────────────────────────────────
-WEIGHTS_PATH = Path(__file__).parent.parent / "unet.weights.h5"
+load_dotenv()
 
-print("Building model…")
-model = build_unet(INPUT_SIZE, NUM_CLASSES)
-model.load_weights(str(WEIGHTS_PATH))
-print(f"✓ Loaded weights from {WEIGHTS_PATH}")
+BASE_DIR = Path(__file__).resolve().parent
+LOGS_DIR = BASE_DIR / "logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOGS_DIR / "app.log"
 
-# warm-up: run inference once so TF kernels are compiled
-_dummy = np.zeros((1, INPUT_SIZE, INPUT_SIZE, 3), dtype=np.float32)
-model.predict(_dummy, verbose=0)
-print("✓ Model warmed up")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("satellite-backend")
 
-# Thread pool so inference doesn't block the async event loop
-_executor = ThreadPoolExecutor(max_workers=1)
 
-# ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="UNet Satellite Segmentation")
+# ISSUE 4 FIX: Proper CORS configuration with secure credentials handling
+def _parse_cors_origins() -> tuple[str | list[str], bool]:
+    """Parse CORS origins and determine allow_credentials setting.
+    
+    ISSUE 4 FIX:
+    - If CORS_ALLOW_ORIGINS == "*", set allow_credentials = False (secure)
+    - Otherwise, parse into list and set allow_credentials = True
+    """
+    cors_origins = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
+    
+    if cors_origins == "*":
+        logger.info("CORS configured with allow_origins='*', credentials disabled")
+        return "*", False
+    
+    origins_list = [origin.strip() for origin in cors_origins.split(",") if origin.strip()]
+    logger.info("CORS configured with explicit origins: %s", origins_list)
+    return origins_list, True
+
+
+cors_origins, allow_creds = _parse_cors_origins()
+
+
+# ISSUE 5 FIX: Use lifespan context manager to manage AsyncClient lifecycle
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle: initialize shared HTTP client on startup, close on shutdown."""
+    logger.info("Starting up: initializing Gemini HTTP client")
+    yield
+    logger.info("Shutting down: closing Gemini HTTP client")
+    await close_gemini_client()
+
+
+app = FastAPI(
+    title="Satellite Image AI Backend",
+    description="Gemini-only satellite analysis pipeline",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
+    allow_credentials=allow_creds,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-def preprocess(image: Image.Image) -> np.ndarray:
-    img = image.convert("RGB").resize((INPUT_SIZE, INPUT_SIZE), Image.BILINEAR)
-    arr = np.array(img, dtype=np.float32) / 255.0
-    return arr[np.newaxis, ...]  # (1, H, W, 3)
+@app.get("/health", response_model=HealthResponse)
+async def health() -> HealthResponse:
+    """Health check endpoint to verify API and Gemini availability."""
+    return HealthResponse(
+        status="ok",
+        gemini_configured=bool(os.getenv("GEMINI_API_KEY")),
+    )
 
 
-def postprocess(prediction: np.ndarray) -> Image.Image:
-    pred = prediction[0]  # remove batch dim → (H, W, NUM_CLASSES)
-
-    if NUM_CLASSES == 1:
-        mask = (pred[:, :, 0] * 255).astype(np.uint8)
-        return Image.fromarray(mask, mode="L").convert("RGB")
-    else:
-        class_map = np.argmax(pred, axis=-1).astype(np.uint8)
-        palette = np.array([
-            [0,   0,   0],
-            [0, 200, 100],
-            [255, 100,  0],
-            [0, 100, 255],
-            [255, 255,  0],
-            [200,   0, 200],
-            [0,  200, 200],
-            [255, 200,   0],
-            [100,  50,   0],
-            [150, 150, 150],
-            [255,   0,   0],
-            [0,   0, 255],
-            [0, 255,   0],
-            [255, 128,   0],
-            [128,   0, 255],
-            [0, 128, 255],
-            [255,   0, 128],
-            [128, 255,   0],
-            [0, 255, 128],
-            [64,  64,  64],
-            [192, 192, 192],
-            [255, 255, 128],
-            [128, 255, 255],
-        ], dtype=np.uint8)
-        rgb = palette[class_map % len(palette)]
-        return Image.fromarray(rgb, mode="RGB")
-
-
-def _run_inference(inp: np.ndarray) -> np.ndarray:
-    import time
-    t = time.time()
-    print(f"[inference] started, input shape={inp.shape}")
-    result = model.predict(inp, verbose=0)
-    print(f"[inference] done in {time.time() - t:.2f}s")
-    return result
-
-
-@app.post("/predict")
-async def predict(file: UploadFile = File(...)):
-    import time
-    t0 = time.time()
-
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(400, "File must be an image.")
-
-    data = await file.read()
-    print(f"[predict] file read in {time.time() - t0:.2f}s, size={len(data)} bytes")
-
+@app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(file: UploadFile = File(...)) -> AnalyzeResponse:
     try:
-        image = Image.open(io.BytesIO(data))
+        if file is None:
+            raise HTTPException(status_code=400, detail="Missing file")
+
+        image_bytes = await file.read()
+        validate_upload(file, image_bytes, max_size_bytes=MAX_FILE_SIZE_BYTES)
+        logger.info("Image received: filename=%s size_bytes=%d", file.filename, len(image_bytes))
+
+        logger.info("Gemini step 1: analyze_image")
+        step1 = await analyze_image(image_bytes)
+
+        logger.info("Gemini step 2: get_improvements")
+        step2 = await get_improvements(step1)
+
+        logger.info("Gemini step 3: generate_image")
+        generated_image = await generate_image(image_bytes, step2["improvements"])
+
+        logger.info("Analyze completed successfully")
+        return AnalyzeResponse(
+            classification=step1["classification"],
+            features=step1["features"],
+            description=step1["description"],
+            improvements=step2["improvements"],
+            generated_image=generated_image,
+        )
+    except HTTPException:
+        raise
+    except GeminiServiceError as exc:
+        logger.exception("Gemini pipeline failed")
+        raise HTTPException(status_code=502, detail=f"Gemini API error: {exc}")
     except Exception:
-        raise HTTPException(400, "Could not decode image.")
-
-    inp = preprocess(image)
-    print(f"[predict] preprocess done in {time.time() - t0:.2f}s")
-
-    loop = asyncio.get_event_loop()
-    pred = await loop.run_in_executor(_executor, _run_inference, inp)
-    print(f"[predict] inference done in {time.time() - t0:.2f}s")
-
-    result_img = postprocess(pred)
-    print(f"[predict] postprocess done in {time.time() - t0:.2f}s")
-
-    buf = io.BytesIO()
-    result_img.save(buf, format="PNG")
-    buf.seek(0)
-    print(f"[predict] total={time.time() - t0:.2f}s")
-    return StreamingResponse(buf, media_type="image/png")
+        logger.exception("/analyze failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
