@@ -1,9 +1,12 @@
 import base64
 import io
+import logging
 from pathlib import Path
 
 from fastapi import HTTPException, UploadFile
 from PIL import Image, ImageOps
+
+logger = logging.getLogger("satellite-backend")
 
 ALLOWED_MIME_TYPES = {
     "image/jpeg",
@@ -13,14 +16,24 @@ ALLOWED_MIME_TYPES = {
     "image/tiff",
 }
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+ALLOWED_IMAGE_FORMATS = {"JPEG", "PNG", "TIFF"}
 MAX_FILE_SIZE_BYTES = 15 * 1024 * 1024
 
 
 def validate_upload(file: UploadFile, data: bytes, max_size_bytes: int = MAX_FILE_SIZE_BYTES) -> None:
+    """Validate uploaded file with strict format checks.
+    
+    Issues fixed:
+    - Reject if BOTH content_type and filename are missing
+    - Verify actual image format after loading with PIL
+    - Reject unsupported formats like BMP, GIF
+    """
     if not data:
+        logger.warning("Validation failed: uploaded file is empty")
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
     if len(data) > max_size_bytes:
+        logger.warning("Validation failed: file too large (size_bytes=%d)", len(data))
         raise HTTPException(
             status_code=413,
             detail=f"File too large. Maximum size is {max_size_bytes // (1024 * 1024)} MB",
@@ -28,17 +41,47 @@ def validate_upload(file: UploadFile, data: bytes, max_size_bytes: int = MAX_FIL
 
     content_type = (file.content_type or "").lower()
     suffix = Path(file.filename or "").suffix.lower()
+    
+    # STRICT: Reject if BOTH content_type and filename metadata are missing
+    if not content_type and not suffix:
+        logger.warning("Validation failed: both content_type and filename are missing")
+        raise HTTPException(
+            status_code=400, 
+            detail="Unsupported file format. Only JPG, PNG, TIFF allowed."
+        )
 
     if content_type and content_type not in ALLOWED_MIME_TYPES:
-        raise HTTPException(status_code=400, detail="Unsupported image content type")
+        logger.warning("Validation failed: unsupported mime type (content_type=%s)", content_type)
+        raise HTTPException(
+            status_code=400, 
+            detail="Unsupported file format. Only JPG, PNG, TIFF allowed."
+        )
 
     if suffix and suffix not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Unsupported image extension")
+        logger.warning("Validation failed: unsupported extension (suffix=%s)", suffix)
+        raise HTTPException(
+            status_code=400, 
+            detail="Unsupported file format. Only JPG, PNG, TIFF allowed."
+        )
 
     try:
         with Image.open(io.BytesIO(data)) as image:
+            # NEW: Verify actual image format after loading with PIL
+            actual_format = image.format
+            if actual_format not in ALLOWED_IMAGE_FORMATS:
+                logger.warning(
+                    "Validation failed: actual image format not allowed (format=%s)", 
+                    actual_format
+                )
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Unsupported file format. Only JPG, PNG, TIFF allowed."
+                )
             image.verify()
+    except HTTPException:
+        raise
     except Exception as exc:
+        logger.warning("Validation failed: invalid image file (error=%s)", str(exc))
         raise HTTPException(status_code=400, detail=f"Invalid image file: {exc}") from exc
 
 

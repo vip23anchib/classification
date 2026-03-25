@@ -18,7 +18,8 @@ Production-ready FastAPI backend for satellite image semantic segmentation and G
 - Returns JSON with classification, features, description, improvements, and generated image
 
 ### 3. **Health Check** (`GET /health`)
-- Verify model and Gemini API availability
+- Verify Gemini API availability
+- No required parameters
 
 ---
 
@@ -52,18 +53,6 @@ CORS_ALLOW_ORIGINS=*
 LOG_LEVEL=INFO
 ```
 
-### 3. Place Model Weights
-
-Download/obtain your `unet.weights.h5` and place it in the `backend/` directory:
-
-```
-backend/
-  unet.weights.h5    ← Must exist here
-  main.py
-  model.py
-  ...
-```
-
 ---
 
 ## 🏃 Launch Server
@@ -82,10 +71,7 @@ uvicorn main:app --host 127.0.0.1 --port 8001 --reload
 
 ```
 INFO:     Uvicorn running on http://127.0.0.1:8001
-Loading segmentation model...
-✓ Loaded weights from ./unet.weights.h5
-✓ Model warmed up
-Segmentation model is ready
+INFO:     Starting up: initializing Gemini HTTP client
 ```
 
 ---
@@ -101,41 +87,13 @@ GET /health
 ```json
 {
   "status": "ok",
-  "model_loaded": true,
   "gemini_configured": true
 }
 ```
 
 ---
 
-### 2. Semantic Segmentation
-```http
-POST /predict
-Content-Type: multipart/form-data
-
-file: <image>
-```
-
-**Supported formats:** JPG, PNG, TIF (max 15 MB)
-
-**Response:**
-```json
-{
-  "mask_base64": "iVBORw0KGgoAAAANSUhEUgAA...",
-  "mask_mime_type": "image/png"
-}
-```
-
-**Example cURL:**
-```bash
-curl -X POST \
-  -F "file=@satellite_image.jpg" \
-  http://127.0.0.1:8001/predict
-```
-
----
-
-### 3. Gemini Analysis Pipeline
+### 2. Gemini Analysis Pipeline
 ```http
 POST /analyze
 Content-Type: multipart/form-data
@@ -198,6 +156,12 @@ backend/
 
 ✅ **Implemented:**
 - API key stored in environment variables (not hardcoded)
+- Strict file validation: format verification after PIL load, rejects unsupported formats
+- Secure CORS: `allow_credentials=False` when `allow_origins="*"` (no mixed-credential attacks)
+- Efficient HTTP: Shared AsyncClient with lifespan management (one client per app instance)
+- Safe JSON parsing: Validates Gemini responses are dict before accessing keys
+- Comprehensive error handling: Proper validation errors at 400/413, API errors at 502, server errors at 500
+- Detailed logging: Validation failures, API errors, all tracked with context
 - File size limit: 15 MB
 - File type validation (MIME + extension)
 - Image integrity verification
@@ -205,10 +169,8 @@ backend/
 - Async error handling with proper HTTP status codes
 - Logging for debugging
 - Model warm-up to avoid first-request latency
-- Thread-pooling for synchronous inference (doesn't block async loop)
-
----
-
+- Th.env                             # Environment variables (API key, config)
+├── requirements.txt                 # Python dependencies
 ## 📊 Error Handling
 
 | Status | Error | Reason |

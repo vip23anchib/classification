@@ -1,5 +1,6 @@
 import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -7,7 +8,13 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from schemas.response_schema import AnalyzeResponse, HealthResponse
-from services.gemini_service import GeminiServiceError, analyze_image, generate_image, get_improvements
+from services.gemini_service import (
+    GeminiServiceError,
+    analyze_image,
+    close_gemini_client,
+    generate_image,
+    get_improvements,
+)
 from utils.image_utils import MAX_FILE_SIZE_BYTES, validate_upload
 
 load_dotenv()
@@ -28,16 +35,49 @@ logging.basicConfig(
 logger = logging.getLogger("satellite-backend")
 
 
+# ISSUE 4 FIX: Proper CORS configuration with secure credentials handling
+def _parse_cors_origins() -> tuple[str | list[str], bool]:
+    """Parse CORS origins and determine allow_credentials setting.
+    
+    ISSUE 4 FIX:
+    - If CORS_ALLOW_ORIGINS == "*", set allow_credentials = False (secure)
+    - Otherwise, parse into list and set allow_credentials = True
+    """
+    cors_origins = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
+    
+    if cors_origins == "*":
+        logger.info("CORS configured with allow_origins='*', credentials disabled")
+        return "*", False
+    
+    origins_list = [origin.strip() for origin in cors_origins.split(",") if origin.strip()]
+    logger.info("CORS configured with explicit origins: %s", origins_list)
+    return origins_list, True
+
+
+cors_origins, allow_creds = _parse_cors_origins()
+
+
+# ISSUE 5 FIX: Use lifespan context manager to manage AsyncClient lifecycle
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle: initialize shared HTTP client on startup, close on shutdown."""
+    logger.info("Starting up: initializing Gemini HTTP client")
+    yield
+    logger.info("Shutting down: closing Gemini HTTP client")
+    await close_gemini_client()
+
+
 app = FastAPI(
     title="Satellite Image AI Backend",
     description="Gemini-only satellite analysis pipeline",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
-    allow_credentials=True,
+    allow_origins=cors_origins,
+    allow_credentials=allow_creds,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -45,6 +85,7 @@ app.add_middleware(
 
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
+    """Health check endpoint to verify API and Gemini availability."""
     return HealthResponse(
         status="ok",
         gemini_configured=bool(os.getenv("GEMINI_API_KEY")),
