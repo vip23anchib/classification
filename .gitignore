@@ -28,3 +28,7 @@ unet.onnx
 unet.weights.h5
 *.h5
 *.onnx
+
+venv/
+__pycache__/
+.env
